@@ -1,6 +1,7 @@
 import sys
 import os
 import traceback
+import pickle
 
 import numpy as np
 import cv2
@@ -13,8 +14,8 @@ print(f"Files: {os.listdir('.')}", flush=True)
 
 app = FastAPI(
     title="Embryo Quality Classifier & Ranker",
-    description="Upload 1 to N embryo images — ranked by EfficientNetB3 viability score",
-    version="5.0.0"
+    description="Dual-branch embryo viability classifier",
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -25,70 +26,34 @@ app.add_middleware(
 )
 
 # ── Model config ──────────────────────────────────────────────────────────────
-MODEL_PATH    = "efficientnet_embryo_model.keras"
-GDRIVE_FILE_ID = "1MnT06A1C2KhHMqmtQeyfhf7_xrWhC1Hy"
-GDRIVE_URL     = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
+MODEL_PATH  = "dual_branch_embryo_model.keras"
+SCALER_PATH = "morph_scaler.pkl"
 
-# ── Download model from Google Drive if not present ───────────────────────────
-def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
-        print(f"✅ Model already present ({os.path.getsize(MODEL_PATH)/1024/1024:.1f} MB)", flush=True)
-        return
-
-    if os.path.exists(MODEL_PATH):
-        print(f"⚠️ Stale/empty model file found — removing.", flush=True)
-        os.remove(MODEL_PATH)
-
-    print("📥 Downloading model via gdown...", flush=True)
-    try:
-        import gdown
-        gdown.download(GDRIVE_URL, MODEL_PATH, quiet=False, fuzzy=True)
-
-        size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
-        if size < 1_000_000:
-            raise RuntimeError(f"Downloaded file too small ({size} bytes) — check Drive permissions.")
-
-        print(f"✅ Download complete: {size/1024/1024:.1f} MB", flush=True)
-
-    except Exception as e:
-        print(f"❌ Download failed: {e}", flush=True)
-        traceback.print_exc()
-        raise RuntimeError(f"Could not download model: {e}")
-
-
-# Run download immediately at startup
-download_model()
-
-
-# ── Lazy model loading ────────────────────────────────────────────────────────
-_model = None
+# ── Model loading ─────────────────────────────────────────────────────────────
+_model  = None
+_scaler = None
 
 def get_model():
-    global _model
+    global _model, _scaler
     if _model is None:
         try:
-            import tensorflow as tf
             from tensorflow.keras.models import load_model
-            print("Loading EfficientNet model...", flush=True)
-            def focal_loss(gamma=2.0, alpha=0.75):
-                def loss(y_true, y_pred):
-                    y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-                    ce = -y_true * tf.math.log(y_pred)
-                    weight = alpha * y_true * tf.pow(1 - y_pred, gamma)
-                    return tf.reduce_mean(tf.reduce_sum(weight * ce, axis=-1))
-                return loss
-            try:
-                _model = load_model(MODEL_PATH, custom_objects={"loss": focal_loss(2.0, 0.75)})
-                print(f"Model loaded with custom loss! Input: {_model.input_shape}", flush=True)
-            except Exception as e1:
-                print(f"Trying compile=False... ({e1})", flush=True)
-                _model = load_model(MODEL_PATH, compile=False)
-                print(f"Model loaded (compile=False)! Input: {_model.input_shape}", flush=True)
+            print("Loading dual-branch model...", flush=True)
+            _model = load_model(MODEL_PATH, compile=False)
+            print(f"✅ Model loaded! Input: {_model.input_shape}", flush=True)
         except Exception as e:
-            print(f"Model loading failed: {e}", flush=True)
+            print(f"❌ Model load failed: {e}", flush=True)
             traceback.print_exc()
-            raise RuntimeError(f"Model loading failed: {e}")
-    return _model
+            raise RuntimeError(f"Model load failed: {e}")
+    if _scaler is None:
+        try:
+            with open(SCALER_PATH, "rb") as f:
+                _scaler = pickle.load(f)
+            print("✅ Scaler loaded!", flush=True)
+        except Exception as e:
+            print(f"⚠️ Scaler load failed (will skip scaling): {e}", flush=True)
+            _scaler = None
+    return _model, _scaler
 
 
 # ── Image helpers ─────────────────────────────────────────────────────────────
@@ -138,22 +103,36 @@ def extract_morphological_features(img: np.ndarray) -> dict:
 
 
 def analyze_image(img: np.ndarray, filename: str = "") -> dict:
-    model = get_model()
+    model, scaler = get_model()
 
-    # EfficientNetB3 expects 260×260, raw pixels [0-255] (no rescale)
+    # Image branch: resize to 224x224, normalize
     img_rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (260, 260)).astype(np.float32)
-    img_batch   = np.expand_dims(img_resized, axis=0)   # shape: (1, 260, 260, 3)
+    img_resized = cv2.resize(img_rgb, (224, 224)).astype(np.float32) / 255.0
+    img_batch   = np.expand_dims(img_resized, axis=0)
 
-    prediction = model.predict(img_batch, verbose=0)[0]  # shape: (2,)
+    # Morphological branch
+    morph = extract_morphological_features(img)
+    morph_features = np.array([[
+        morph["symmetry_score"],
+        morph["fragmentation_ratio"],
+        morph["cell_count"]
+    ]], dtype=np.float32)
+
+    if scaler is not None:
+        morph_features = scaler.transform(morph_features).astype(np.float32)
+
+    # Predict
+    try:
+        prediction = model.predict([img_batch, morph_features], verbose=0)[0]
+    except Exception:
+        # Fallback: try single input
+        prediction = model.predict(img_batch, verbose=0)[0]
 
     class_id   = int(np.argmax(prediction))
-    good_prob  = float(prediction[1])   # class 1 = Good
-    poor_prob  = float(prediction[0])   # class 0 = Poor
+    good_prob  = float(prediction[1]) if len(prediction) > 1 else float(prediction[0])
+    poor_prob  = 1.0 - good_prob
     confidence = float(np.max(prediction))
     score      = round(good_prob * 100, 2)
-
-    morph = extract_morphological_features(img)
 
     if score >= 80:
         rec = "Highly recommended for transfer"
@@ -165,16 +144,16 @@ def analyze_image(img: np.ndarray, filename: str = "") -> dict:
         rec = "Poor quality — not recommended for transfer"
 
     return {
-        "filename":              filename,
-        "label":                 "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
-        "confidence":            round(confidence, 4),
+        "filename":                filename,
+        "label":                   "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
+        "confidence":              round(confidence, 4),
         "viability_score_percent": score,
-        "good_probability":      round(good_prob, 4),
-        "poor_probability":      round(poor_prob, 4),
-        "symmetry_score":        morph["symmetry_score"],
-        "fragmentation_ratio":   morph["fragmentation_ratio"],
-        "cell_count":            morph["cell_count"],
-        "recommendation":        rec,
+        "good_probability":        round(good_prob, 4),
+        "poor_probability":        round(poor_prob, 4),
+        "symmetry_score":          morph["symmetry_score"],
+        "fragmentation_ratio":     morph["fragmentation_ratio"],
+        "cell_count":              morph["cell_count"],
+        "recommendation":          rec,
     }
 
 
@@ -182,11 +161,11 @@ def analyze_image(img: np.ndarray, filename: str = "") -> dict:
 @app.get("/")
 def root():
     return {
-        "message": "Embryo Quality Classifier & Ranker — EfficientNetB3",
-        "version": "5.0.0",
+        "message": "Embryo Quality Classifier & Ranker",
+        "version": "4.0.0",
         "endpoints": {
-            "POST /predict": "Single embryo image upload",
-            "POST /rank":    "N embryo images → ranked by viability",
+            "POST /predict": "Single embryo image",
+            "POST /rank":    "N embryo images → ranked",
         },
         "docs": "/docs"
     }
@@ -197,29 +176,27 @@ def health():
 
 @app.get("/debug")
 def debug():
-    exists = os.path.exists(MODEL_PATH)
     return {
         "model_file":  MODEL_PATH,
-        "exists":      exists,
-        "size_mb":     round(os.path.getsize(MODEL_PATH) / 1024 / 1024, 2) if exists else 0,
-        "gdrive_id":   GDRIVE_FILE_ID,
+        "scaler_file": SCALER_PATH,
+        "model_exists":  os.path.exists(MODEL_PATH),
+        "scaler_exists": os.path.exists(SCALER_PATH),
+        "model_size_mb": round(os.path.getsize(MODEL_PATH)/1024/1024, 2) if os.path.exists(MODEL_PATH) else 0,
     }
 
 
 @app.post("/predict")
 async def predict_single(file: UploadFile = File(...)):
-    """Upload a single embryo image → get viability analysis."""
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail=f"Must be an image, got: {file.content_type}")
     img = decode_upload(await file.read())
     if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image. Send a valid JPG/PNG.")
+        raise HTTPException(status_code=400, detail="Could not decode image.")
     return analyze_image(img, filename=file.filename)
 
 
 @app.post("/rank")
 async def rank_embryos(files: list[UploadFile] = File(...)):
-    """Upload N embryo images → ranked list best to worst by viability score."""
     if len(files) < 1:
         raise HTTPException(status_code=400, detail="Upload at least 1 image.")
     if len(files) > 50:
@@ -237,8 +214,8 @@ async def rank_embryos(files: list[UploadFile] = File(...)):
     results.sort(key=lambda x: x["viability_score_percent"], reverse=True)
 
     return {
-        "total_analyzed":     len(results),
-        "best_embryo":        results[0]["filename"],
+        "total_analyzed":       len(results),
+        "best_embryo":          results[0]["filename"],
         "best_viability_score": results[0]["viability_score_percent"],
-        "ranked_embryos":     [{"rank": i+1, **r} for i, r in enumerate(results)]
+        "ranked_embryos":       [{"rank": i+1, **r} for i, r in enumerate(results)]
     }
