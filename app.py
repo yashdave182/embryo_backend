@@ -1,36 +1,23 @@
 import sys
 import os
 import traceback
+import pickle
+from io import BytesIO
 
-# ── Startup diagnostics — printed before anything else ──────────────────────
-print("=== STARTUP DIAGNOSTICS ===", flush=True)
-print(f"Python: {sys.version}", flush=True)
-print(f"Working dir: {os.getcwd()}", flush=True)
-print(f"Files present: {os.listdir('.')}", flush=True)
-
-# Check each import individually so we know exactly what's missing
-for pkg in ["fastapi", "uvicorn", "numpy", "cv2", "tensorflow", "sklearn", "pickle"]:
-    try:
-        __import__(pkg)
-        print(f"  ✅ {pkg}", flush=True)
-    except ImportError as e:
-        print(f"  ❌ {pkg} — {e}", flush=True)
-
-print("=== END DIAGNOSTICS ===", flush=True)
-
-# ── Main app ─────────────────────────────────────────────────────────────────
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 import numpy as np
 import cv2
-import requests
-import pickle
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+
+# ── Startup diagnostics ───────────────────────────────────────────────────────
+print("=== STARTUP ===", flush=True)
+print(f"Python: {sys.version}", flush=True)
+print(f"Files: {os.listdir('.')}", flush=True)
 
 app = FastAPI(
-    title="Embryo Quality Classifier & Ranker API",
-    description="Classify and rank multiple embryos by viability score",
-    version="2.0.0"
+    title="Embryo Quality Classifier & Ranker",
+    description="Upload 1 to N embryo images — get ranked results by viability score",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -51,6 +38,7 @@ def get_models():
     if _fusion_model is None:
         try:
             from tensorflow.keras.models import load_model, Model as KModel
+
             print("Loading EfficientNet...", flush=True)
             full_model = load_model("efficientnet_embryo_model.h5")
             _feature_extractor = KModel(
@@ -59,10 +47,13 @@ def get_models():
             )
             print("Loading fusion model...", flush=True)
             _fusion_model = load_model("dual_branch_embryo_model.keras")
+
             print("Loading scaler...", flush=True)
             with open("morph_scaler.pkl", "rb") as f:
                 _scaler = pickle.load(f)
+
             print("✅ All models loaded!", flush=True)
+
         except Exception as e:
             print(f"❌ Model loading failed: {e}", flush=True)
             traceback.print_exc()
@@ -71,16 +62,12 @@ def get_models():
     return _feature_extractor, _fusion_model, _scaler
 
 
-# ── Helper functions ──────────────────────────────────────────────────────────
-def download_image(url: str):
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-        arr = np.frombuffer(resp.content, np.uint8)
-        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    except Exception as e:
-        print(f"Download error: {e}", flush=True)
-        return None
+# ── Image processing helpers ──────────────────────────────────────────────────
+def decode_upload(file_bytes: bytes) -> np.ndarray:
+    """Convert raw uploaded bytes → OpenCV BGR image."""
+    arr = np.frombuffer(file_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    return img
 
 
 def extract_efficientnet_features(img: np.ndarray, extractor) -> np.ndarray:
@@ -118,51 +105,41 @@ def extract_morphological_features(img: np.ndarray) -> np.ndarray:
     return np.array([symmetry_score, fragmentation_ratio])
 
 
-def analyze_single_image(img: np.ndarray) -> dict:
+def analyze_image(img: np.ndarray) -> dict:
     extractor, fusion, scaler = get_models()
+
     deep_features = extract_efficientnet_features(img, extractor)
     morph_raw = extract_morphological_features(img)
     morph_scaled = scaler.transform([morph_raw])[0]
+
     combined = np.expand_dims(np.concatenate([deep_features, morph_scaled]), axis=0)
     prediction = fusion.predict(combined, verbose=0)[0]
+
     class_id = int(np.argmax(prediction))
     good_prob = float(prediction[1])
     poor_prob = float(prediction[0])
+
+    score = round(good_prob * 100, 2)
+
+    if score >= 80:
+        rec = "Highly recommended for transfer"
+    elif score >= 60:
+        rec = "Suitable for transfer"
+    elif score >= 40:
+        rec = "Marginal quality — use only if no better option"
+    else:
+        rec = "Poor quality — not recommended for transfer"
+
     return {
-        "class_id": class_id,
         "label": "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
         "confidence": round(float(np.max(prediction)), 4),
-        "viability_score_percent": round(good_prob * 100, 2),
+        "viability_score_percent": score,
         "good_probability": round(good_prob, 4),
         "poor_probability": round(poor_prob, 4),
         "symmetry_score": round(float(morph_raw[0]), 4),
         "fragmentation_ratio": round(float(morph_raw[1]), 6),
+        "recommendation": rec,
     }
-
-
-# ── Schemas ───────────────────────────────────────────────────────────────────
-class SingleRequest(BaseModel):
-    image_url: str
-
-class RankRequest(BaseModel):
-    embryos: list[dict]
-
-class EmbryoResult(BaseModel):
-    rank: int
-    id: str
-    label: str
-    viability_score_percent: float
-    confidence: float
-    good_probability: float
-    poor_probability: float
-    symmetry_score: float
-    fragmentation_ratio: float
-    recommendation: str
-
-class RankResponse(BaseModel):
-    total_analyzed: int
-    best_embryo_id: str
-    ranked_embryos: list[EmbryoResult]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -170,75 +147,107 @@ class RankResponse(BaseModel):
 def root():
     return {
         "message": "Embryo Quality Classifier & Ranker",
-        "endpoints": {"POST /predict": "Single embryo", "POST /rank": "Rank multiple"},
+        "usage": {
+            "single": "POST /predict  — upload 1 image file",
+            "batch":  "POST /rank     — upload N image files, get ranked results",
+        },
         "docs": "/docs"
     }
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/debug")
 def debug():
-    """Check model files and imports."""
     files = ["efficientnet_embryo_model.h5", "dual_branch_embryo_model.keras", "morph_scaler.pkl"]
-    file_status = {
-        f: {"exists": os.path.exists(f), "size_mb": round(os.path.getsize(f)/1024/1024, 2) if os.path.exists(f) else 0}
-        for f in files
+    return {
+        "files": {
+            f: {
+                "exists": os.path.exists(f),
+                "size_mb": round(os.path.getsize(f) / 1024 / 1024, 2) if os.path.exists(f) else 0
+            }
+            for f in files
+        }
     }
-    import_status = {}
-    for pkg in ["fastapi", "numpy", "cv2", "tensorflow", "sklearn"]:
-        try:
-            __import__(pkg)
-            import_status[pkg] = "ok"
-        except ImportError as e:
-            import_status[pkg] = str(e)
 
-    return {"files": file_status, "imports": import_status}
 
 @app.post("/predict")
-def predict_single(request: SingleRequest):
-    img = download_image(request.image_url)
-    if img is None:
-        raise HTTPException(status_code=400, detail="Could not download or decode image.")
-    return analyze_single_image(img)
+async def predict_single(file: UploadFile = File(...)):
+    """
+    Upload a single embryo image.
+    Returns: label, viability score, confidence, morphological features.
 
-@app.post("/rank", response_model=RankResponse)
-def rank_embryos(request: RankRequest):
-    if not 1 <= len(request.embryos) <= 20:
-        raise HTTPException(status_code=400, detail="Provide 1–20 embryos.")
+    Try it: curl -X POST /predict -F "file=@embryo.jpg"
+    """
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail=f"File must be an image, got: {file.content_type}")
+
+    img_bytes = await file.read()
+    img = decode_upload(img_bytes)
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image. Make sure it's a valid JPG/PNG.")
+
+    result = analyze_image(img)
+    result["filename"] = file.filename
+    return result
+
+
+@app.post("/rank")
+async def rank_embryos(files: list[UploadFile] = File(...)):
+    """
+    Upload N embryo images at once.
+    Returns all embryos ranked #1 (best) to #N (worst) by viability score.
+
+    Try it: curl -X POST /rank -F "files=@e1.jpg" -F "files=@e2.jpg" -F "files=@e3.jpg"
+    """
+    if len(files) < 1:
+        raise HTTPException(status_code=400, detail="Upload at least 1 image.")
+    if len(files) > 50:
+        raise HTTPException(status_code=400, detail="Maximum 50 images per request.")
 
     results = []
-    for i, embryo in enumerate(request.embryos):
-        embryo_id = embryo.get("id") or f"Embryo_{i+1}"
-        image_url = embryo.get("image_url")
-        if not image_url:
-            raise HTTPException(status_code=400, detail=f"Missing image_url for '{embryo_id}'.")
-        img = download_image(image_url)
-        if img is None:
-            raise HTTPException(status_code=400, detail=f"Could not download image for '{embryo_id}'.")
-        results.append({"id": embryo_id, **analyze_single_image(img)})
 
+    for i, file in enumerate(files):
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"File '{file.filename}' is not an image (got {file.content_type})."
+            )
+
+        img_bytes = await file.read()
+        img = decode_upload(img_bytes)
+
+        if img is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Could not decode '{file.filename}'. Make sure it's a valid JPG/PNG."
+            )
+
+        analysis = analyze_image(img)
+        results.append({
+            "filename": file.filename,
+            "embryo_id": f"E{i+1}",
+            **analysis
+        })
+
+    # Sort best → worst
     results.sort(key=lambda x: x["viability_score_percent"], reverse=True)
 
+    # Assign final ranks
     ranked = []
     for rank_pos, r in enumerate(results, start=1):
-        score = r["viability_score_percent"]
-        if score >= 80:
-            rec = "Highly recommended for transfer"
-        elif score >= 60:
-            rec = "Suitable for transfer"
-        elif score >= 40:
-            rec = "Marginal quality — use only if no better option"
-        else:
-            rec = "Poor quality — not recommended for transfer"
+        ranked.append({
+            "rank": rank_pos,
+            **r
+        })
 
-        ranked.append(EmbryoResult(
-            rank=rank_pos, id=r["id"], label=r["label"],
-            viability_score_percent=r["viability_score_percent"],
-            confidence=r["confidence"], good_probability=r["good_probability"],
-            poor_probability=r["poor_probability"], symmetry_score=r["symmetry_score"],
-            fragmentation_ratio=r["fragmentation_ratio"], recommendation=rec,
-        ))
-
-    return RankResponse(total_analyzed=len(ranked), best_embryo_id=ranked[0].id, ranked_embryos=ranked)
+    return {
+        "total_analyzed": len(ranked),
+        "best_embryo": ranked[0]["filename"],
+        "best_viability_score": ranked[0]["viability_score_percent"],
+        "ranked_embryos": ranked
+    }
