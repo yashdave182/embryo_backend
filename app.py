@@ -27,49 +27,28 @@ app.add_middleware(
 # ── Model config ──────────────────────────────────────────────────────────────
 MODEL_PATH    = "efficientnet_embryo_model.keras"
 GDRIVE_FILE_ID = "1MnT06A1C2KhHMqmtQeyfhf7_xrWhC1Hy"
-GDRIVE_URL     = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}"
+GDRIVE_URL     = f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}"
 
 # ── Download model from Google Drive if not present ───────────────────────────
 def download_model():
-    if os.path.exists(MODEL_PATH):
-        size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
-        print(f"✅ Model already present ({size_mb:.1f} MB), skipping download.", flush=True)
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
+        print(f"✅ Model already present ({os.path.getsize(MODEL_PATH)/1024/1024:.1f} MB)", flush=True)
         return
 
-    print("📥 Downloading model from Google Drive...", flush=True)
+    if os.path.exists(MODEL_PATH):
+        print(f"⚠️ Stale/empty model file found — removing.", flush=True)
+        os.remove(MODEL_PATH)
+
+    print("📥 Downloading model via gdown...", flush=True)
     try:
-        import requests
+        import gdown
+        gdown.download(GDRIVE_URL, MODEL_PATH, quiet=False, fuzzy=True)
 
-        # Google Drive large-file download needs a confirmation token
-        session = requests.Session()
-        response = session.get(GDRIVE_URL, stream=True, timeout=120)
+        size = os.path.getsize(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
+        if size < 1_000_000:
+            raise RuntimeError(f"Downloaded file too small ({size} bytes) — check Drive permissions.")
 
-        # Check if Drive is asking for virus-scan confirmation
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith("download_warning"):
-                token = value
-                break
-
-        if token:
-            print("🔄 Large file — fetching with confirmation token...", flush=True)
-            response = session.get(
-                GDRIVE_URL,
-                params={"confirm": token},
-                stream=True,
-                timeout=300
-            )
-
-        # Write to disk in chunks
-        total = 0
-        with open(MODEL_PATH, "wb") as f:
-            for chunk in response.iter_content(chunk_size=32768):
-                if chunk:
-                    f.write(chunk)
-                    total += len(chunk)
-
-        size_mb = total / 1024 / 1024
-        print(f"✅ Download complete: {size_mb:.1f} MB saved to {MODEL_PATH}", flush=True)
+        print(f"✅ Download complete: {size/1024/1024:.1f} MB", flush=True)
 
     except Exception as e:
         print(f"❌ Download failed: {e}", flush=True)
