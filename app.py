@@ -1,23 +1,20 @@
 import sys
 import os
 import traceback
-import pickle
-from io import BytesIO
 
 import numpy as np
 import cv2
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
-# ── Startup diagnostics ───────────────────────────────────────────────────────
 print("=== STARTUP ===", flush=True)
 print(f"Python: {sys.version}", flush=True)
 print(f"Files: {os.listdir('.')}", flush=True)
 
 app = FastAPI(
     title="Embryo Quality Classifier & Ranker",
-    description="Upload 1 to N embryo images — get ranked results by viability score",
-    version="3.0.0"
+    description="Upload 1 to N embryo images — ranked by EfficientNetB3 viability score",
+    version="5.0.0"
 )
 
 app.add_middleware(
@@ -27,61 +24,99 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Lazy model loading ────────────────────────────────────────────────────────
-_feature_extractor = None
-_fusion_model = None
-_scaler = None
+# ── Model config ──────────────────────────────────────────────────────────────
+MODEL_PATH    = "efficientnet_embryo_model.keras"
+GDRIVE_FILE_ID = "1MnT06A1C2KhHMqmtQeyfhf7_xrWhC1Hy"
+GDRIVE_URL     = f"https://drive.google.com/uc?export=download&id={GDRIVE_FILE_ID}"
 
-def get_models():
-    global _feature_extractor, _fusion_model, _scaler
+# ── Download model from Google Drive if not present ───────────────────────────
+def download_model():
+    if os.path.exists(MODEL_PATH):
+        size_mb = os.path.getsize(MODEL_PATH) / 1024 / 1024
+        print(f"✅ Model already present ({size_mb:.1f} MB), skipping download.", flush=True)
+        return
 
-    if _fusion_model is None:
-        try:
-            from tensorflow.keras.models import load_model, Model as KModel
+    print("📥 Downloading model from Google Drive...", flush=True)
+    try:
+        import requests
 
-            print("Loading EfficientNet...", flush=True)
-            full_model = load_model("efficientnet_embryo_model.h5")
-            _feature_extractor = KModel(
-                inputs=full_model.input,
-                outputs=full_model.layers[-3].output,
+        # Google Drive large-file download needs a confirmation token
+        session = requests.Session()
+        response = session.get(GDRIVE_URL, stream=True, timeout=120)
+
+        # Check if Drive is asking for virus-scan confirmation
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith("download_warning"):
+                token = value
+                break
+
+        if token:
+            print("🔄 Large file — fetching with confirmation token...", flush=True)
+            response = session.get(
+                GDRIVE_URL,
+                params={"confirm": token},
+                stream=True,
+                timeout=300
             )
-            print("Loading fusion model...", flush=True)
-            _fusion_model = load_model("dual_branch_embryo_model.keras")
 
-            print("Loading scaler...", flush=True)
-            with open("morph_scaler.pkl", "rb") as f:
-                _scaler = pickle.load(f)
+        # Write to disk in chunks
+        total = 0
+        with open(MODEL_PATH, "wb") as f:
+            for chunk in response.iter_content(chunk_size=32768):
+                if chunk:
+                    f.write(chunk)
+                    total += len(chunk)
 
-            print("✅ All models loaded!", flush=True)
+        size_mb = total / 1024 / 1024
+        print(f"✅ Download complete: {size_mb:.1f} MB saved to {MODEL_PATH}", flush=True)
 
+    except Exception as e:
+        print(f"❌ Download failed: {e}", flush=True)
+        traceback.print_exc()
+        raise RuntimeError(f"Could not download model: {e}")
+
+
+# Run download immediately at startup
+download_model()
+
+
+# ── Lazy model loading ────────────────────────────────────────────────────────
+_model = None
+
+def get_model():
+    global _model
+    if _model is None:
+        try:
+            from tensorflow.keras.models import load_model
+            print("Loading EfficientNet model...", flush=True)
+            _model = load_model(MODEL_PATH)
+            print(f"✅ Model loaded! Input: {_model.input_shape}  Output: {_model.output_shape}", flush=True)
         except Exception as e:
             print(f"❌ Model loading failed: {e}", flush=True)
             traceback.print_exc()
             raise RuntimeError(f"Model loading failed: {e}")
+    return _model
 
-    return _feature_extractor, _fusion_model, _scaler
 
-
-# ── Image processing helpers ──────────────────────────────────────────────────
+# ── Image helpers ─────────────────────────────────────────────────────────────
 def decode_upload(file_bytes: bytes) -> np.ndarray:
-    """Convert raw uploaded bytes → OpenCV BGR image."""
     arr = np.frombuffer(file_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return img
+    return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def extract_efficientnet_features(img: np.ndarray, extractor) -> np.ndarray:
-    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (224, 224)) / 255.0
-    features = extractor.predict(np.expand_dims(img_resized, axis=0), verbose=0)
-    return features.flatten()
-
-
-def extract_morphological_features(img: np.ndarray) -> np.ndarray:
+def extract_morphological_features(img: np.ndarray) -> dict:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    blur = cv2.GaussianBlur(gray, (9, 9), 0)
+
+    _, thresh_normal = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY     + cv2.THRESH_OTSU)
+    _, thresh_inv    = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    contours_normal, _ = cv2.findContours(thresh_normal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_inv, _    = cv2.findContours(thresh_inv,    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    contours = contours_inv if len(contours_inv) > len(contours_normal) else contours_normal
+    thresh   = thresh_inv   if len(contours_inv) > len(contours_normal) else thresh_normal
 
     centroids = []
     for cnt in contours:
@@ -98,28 +133,35 @@ def extract_morphological_features(img: np.ndarray) -> np.ndarray:
         ]
         symmetry_score = float(np.mean(distances))
 
-    embryo_area = int(np.sum(thresh == 255))
+    embryo_area     = int(np.sum(thresh == 255))
     fragmented_area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) < 500)
     fragmentation_ratio = fragmented_area / embryo_area if embryo_area > 0 else 0.0
+    cell_count = len([c for c in contours if cv2.contourArea(c) > 200])
 
-    return np.array([symmetry_score, fragmentation_ratio])
+    return {
+        "symmetry_score":      round(symmetry_score, 4),
+        "fragmentation_ratio": round(fragmentation_ratio, 6),
+        "cell_count":          cell_count,
+    }
 
 
-def analyze_image(img: np.ndarray) -> dict:
-    extractor, fusion, scaler = get_models()
+def analyze_image(img: np.ndarray, filename: str = "") -> dict:
+    model = get_model()
 
-    deep_features = extract_efficientnet_features(img, extractor)
-    morph_raw = extract_morphological_features(img)
-    morph_scaled = scaler.transform([morph_raw])[0]
+    # EfficientNetB3 expects 260×260, raw pixels [0-255] (no rescale)
+    img_rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, (260, 260)).astype(np.float32)
+    img_batch   = np.expand_dims(img_resized, axis=0)   # shape: (1, 260, 260, 3)
 
-    combined = np.expand_dims(np.concatenate([deep_features, morph_scaled]), axis=0)
-    prediction = fusion.predict(combined, verbose=0)[0]
+    prediction = model.predict(img_batch, verbose=0)[0]  # shape: (2,)
 
-    class_id = int(np.argmax(prediction))
-    good_prob = float(prediction[1])
-    poor_prob = float(prediction[0])
+    class_id   = int(np.argmax(prediction))
+    good_prob  = float(prediction[1])   # class 1 = Good
+    poor_prob  = float(prediction[0])   # class 0 = Poor
+    confidence = float(np.max(prediction))
+    score      = round(good_prob * 100, 2)
 
-    score = round(good_prob * 100, 2)
+    morph = extract_morphological_features(img)
 
     if score >= 80:
         rec = "Highly recommended for transfer"
@@ -131,14 +173,16 @@ def analyze_image(img: np.ndarray) -> dict:
         rec = "Poor quality — not recommended for transfer"
 
     return {
-        "label": "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
-        "confidence": round(float(np.max(prediction)), 4),
+        "filename":              filename,
+        "label":                 "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
+        "confidence":            round(confidence, 4),
         "viability_score_percent": score,
-        "good_probability": round(good_prob, 4),
-        "poor_probability": round(poor_prob, 4),
-        "symmetry_score": round(float(morph_raw[0]), 4),
-        "fragmentation_ratio": round(float(morph_raw[1]), 6),
-        "recommendation": rec,
+        "good_probability":      round(good_prob, 4),
+        "poor_probability":      round(poor_prob, 4),
+        "symmetry_score":        morph["symmetry_score"],
+        "fragmentation_ratio":   morph["fragmentation_ratio"],
+        "cell_count":            morph["cell_count"],
+        "recommendation":        rec,
     }
 
 
@@ -146,108 +190,63 @@ def analyze_image(img: np.ndarray) -> dict:
 @app.get("/")
 def root():
     return {
-        "message": "Embryo Quality Classifier & Ranker",
-        "usage": {
-            "single": "POST /predict  — upload 1 image file",
-            "batch":  "POST /rank     — upload N image files, get ranked results",
+        "message": "Embryo Quality Classifier & Ranker — EfficientNetB3",
+        "version": "5.0.0",
+        "endpoints": {
+            "POST /predict": "Single embryo image upload",
+            "POST /rank":    "N embryo images → ranked by viability",
         },
         "docs": "/docs"
     }
-
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-
 @app.get("/debug")
 def debug():
-    files = ["efficientnet_embryo_model.h5", "dual_branch_embryo_model.keras", "morph_scaler.pkl"]
+    exists = os.path.exists(MODEL_PATH)
     return {
-        "files": {
-            f: {
-                "exists": os.path.exists(f),
-                "size_mb": round(os.path.getsize(f) / 1024 / 1024, 2) if os.path.exists(f) else 0
-            }
-            for f in files
-        }
+        "model_file":  MODEL_PATH,
+        "exists":      exists,
+        "size_mb":     round(os.path.getsize(MODEL_PATH) / 1024 / 1024, 2) if exists else 0,
+        "gdrive_id":   GDRIVE_FILE_ID,
     }
 
 
 @app.post("/predict")
 async def predict_single(file: UploadFile = File(...)):
-    """
-    Upload a single embryo image.
-    Returns: label, viability score, confidence, morphological features.
-
-    Try it: curl -X POST /predict -F "file=@embryo.jpg"
-    """
+    """Upload a single embryo image → get viability analysis."""
     if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail=f"File must be an image, got: {file.content_type}")
-
-    img_bytes = await file.read()
-    img = decode_upload(img_bytes)
-
+        raise HTTPException(status_code=400, detail=f"Must be an image, got: {file.content_type}")
+    img = decode_upload(await file.read())
     if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image. Make sure it's a valid JPG/PNG.")
-
-    result = analyze_image(img)
-    result["filename"] = file.filename
-    return result
+        raise HTTPException(status_code=400, detail="Could not decode image. Send a valid JPG/PNG.")
+    return analyze_image(img, filename=file.filename)
 
 
 @app.post("/rank")
 async def rank_embryos(files: list[UploadFile] = File(...)):
-    """
-    Upload N embryo images at once.
-    Returns all embryos ranked #1 (best) to #N (worst) by viability score.
-
-    Try it: curl -X POST /rank -F "files=@e1.jpg" -F "files=@e2.jpg" -F "files=@e3.jpg"
-    """
+    """Upload N embryo images → ranked list best to worst by viability score."""
     if len(files) < 1:
         raise HTTPException(status_code=400, detail="Upload at least 1 image.")
     if len(files) > 50:
-        raise HTTPException(status_code=400, detail="Maximum 50 images per request.")
+        raise HTTPException(status_code=400, detail="Max 50 images per request.")
 
     results = []
-
     for i, file in enumerate(files):
         if not file.content_type.startswith("image/"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"File '{file.filename}' is not an image (got {file.content_type})."
-            )
-
-        img_bytes = await file.read()
-        img = decode_upload(img_bytes)
-
+            raise HTTPException(status_code=400, detail=f"'{file.filename}' is not an image.")
+        img = decode_upload(await file.read())
         if img is None:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Could not decode '{file.filename}'. Make sure it's a valid JPG/PNG."
-            )
+            raise HTTPException(status_code=400, detail=f"Could not decode '{file.filename}'.")
+        results.append({"embryo_id": f"E{i+1}", **analyze_image(img, filename=file.filename)})
 
-        analysis = analyze_image(img)
-        results.append({
-            "filename": file.filename,
-            "embryo_id": f"E{i+1}",
-            **analysis
-        })
-
-    # Sort best → worst
     results.sort(key=lambda x: x["viability_score_percent"], reverse=True)
 
-    # Assign final ranks
-    ranked = []
-    for rank_pos, r in enumerate(results, start=1):
-        ranked.append({
-            "rank": rank_pos,
-            **r
-        })
-
     return {
-        "total_analyzed": len(ranked),
-        "best_embryo": ranked[0]["filename"],
-        "best_viability_score": ranked[0]["viability_score_percent"],
-        "ranked_embryos": ranked
+        "total_analyzed":     len(results),
+        "best_embryo":        results[0]["filename"],
+        "best_viability_score": results[0]["viability_score_percent"],
+        "ranked_embryos":     [{"rank": i+1, **r} for i, r in enumerate(results)]
     }
