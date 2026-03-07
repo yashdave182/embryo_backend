@@ -67,12 +67,25 @@ def get_model():
     global _model
     if _model is None:
         try:
+            import tensorflow as tf
             from tensorflow.keras.models import load_model
             print("Loading EfficientNet model...", flush=True)
-            _model = load_model(MODEL_PATH)
-            print(f"✅ Model loaded! Input: {_model.input_shape}  Output: {_model.output_shape}", flush=True)
+            def focal_loss(gamma=2.0, alpha=0.75):
+                def loss(y_true, y_pred):
+                    y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
+                    ce = -y_true * tf.math.log(y_pred)
+                    weight = alpha * y_true * tf.pow(1 - y_pred, gamma)
+                    return tf.reduce_mean(tf.reduce_sum(weight * ce, axis=-1))
+                return loss
+            try:
+                _model = load_model(MODEL_PATH, custom_objects={"loss": focal_loss(2.0, 0.75)})
+                print(f"Model loaded with custom loss! Input: {_model.input_shape}", flush=True)
+            except Exception as e1:
+                print(f"Trying compile=False... ({e1})", flush=True)
+                _model = load_model(MODEL_PATH, compile=False)
+                print(f"Model loaded (compile=False)! Input: {_model.input_shape}", flush=True)
         except Exception as e:
-            print(f"❌ Model loading failed: {e}", flush=True)
+            print(f"Model loading failed: {e}", flush=True)
             traceback.print_exc()
             raise RuntimeError(f"Model loading failed: {e}")
     return _model
