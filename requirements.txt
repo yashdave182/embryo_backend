@@ -9,3 +9,4 @@ scikit-learn
 requests
 pillow
 h5py
+gdown
