@@ -2,20 +2,22 @@ import sys
 import os
 import traceback
 import pickle
+from io import BytesIO
 
 import numpy as np
 import cv2
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 
+# ── Startup diagnostics ───────────────────────────────────────────────────────
 print("=== STARTUP ===", flush=True)
 print(f"Python: {sys.version}", flush=True)
 print(f"Files: {os.listdir('.')}", flush=True)
 
 app = FastAPI(
     title="Embryo Quality Classifier & Ranker",
-    description="Dual-branch embryo viability classifier",
-    version="4.0.0"
+    description="Upload 1 to N embryo images — get ranked results by viability score",
+    version="3.1.0"
 )
 
 app.add_middleware(
@@ -25,55 +27,62 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Model config ──────────────────────────────────────────────────────────────
-MODEL_PATH  = "dual_branch_embryo_model.keras"
-SCALER_PATH = "morph_scaler.pkl"
+# ── Threshold (lowered to fix class imbalance: 716 Poor vs 124 Good) ─────────
+GOOD_THRESHOLD = 0.15
 
-# ── Model loading ─────────────────────────────────────────────────────────────
-_model  = None
+# ── Lazy model loading ────────────────────────────────────────────────────────
+_feature_extractor = None
+_fusion_model = None
 _scaler = None
 
-def get_model():
-    global _model, _scaler
-    if _model is None:
+def get_models():
+    global _feature_extractor, _fusion_model, _scaler
+
+    if _fusion_model is None:
         try:
-            from tensorflow.keras.models import load_model
-            print("Loading dual-branch model...", flush=True)
-            _model = load_model(MODEL_PATH, compile=False)
-            print(f"✅ Model loaded! Input: {_model.input_shape}", flush=True)
-        except Exception as e:
-            print(f"❌ Model load failed: {e}", flush=True)
-            traceback.print_exc()
-            raise RuntimeError(f"Model load failed: {e}")
-    if _scaler is None:
-        try:
-            with open(SCALER_PATH, "rb") as f:
+            from tensorflow.keras.models import load_model, Model as KModel
+
+            print("Loading EfficientNet...", flush=True)
+            full_model = load_model("efficientnet_embryo_model.h5")
+            _feature_extractor = KModel(
+                inputs=full_model.input,
+                outputs=full_model.layers[-3].output,
+            )
+            print("Loading fusion model...", flush=True)
+            _fusion_model = load_model("dual_branch_embryo_model.keras")
+
+            print("Loading scaler...", flush=True)
+            with open("morph_scaler.pkl", "rb") as f:
                 _scaler = pickle.load(f)
-            print("✅ Scaler loaded!", flush=True)
+
+            print("✅ All models loaded!", flush=True)
+
         except Exception as e:
-            print(f"⚠️ Scaler load failed (will skip scaling): {e}", flush=True)
-            _scaler = None
-    return _model, _scaler
+            print(f"❌ Model loading failed: {e}", flush=True)
+            traceback.print_exc()
+            raise RuntimeError(f"Model loading failed: {e}")
+
+    return _feature_extractor, _fusion_model, _scaler
 
 
-# ── Image helpers ─────────────────────────────────────────────────────────────
+# ── Image processing helpers ──────────────────────────────────────────────────
 def decode_upload(file_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(file_bytes, np.uint8)
     return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
 
-def extract_morphological_features(img: np.ndarray) -> dict:
+def extract_efficientnet_features(img: np.ndarray, extractor) -> np.ndarray:
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img_rgb, (224, 224)) / 255.0
+    features = extractor.predict(np.expand_dims(img_resized, axis=0), verbose=0)
+    return features.flatten()
+
+
+def extract_morphological_features(img: np.ndarray) -> np.ndarray:
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    blur = cv2.GaussianBlur(gray, (9, 9), 0)
-
-    _, thresh_normal = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY     + cv2.THRESH_OTSU)
-    _, thresh_inv    = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    contours_normal, _ = cv2.findContours(thresh_normal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours_inv, _    = cv2.findContours(thresh_inv,    cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    contours = contours_inv if len(contours_inv) > len(contours_normal) else contours_normal
-    thresh   = thresh_inv   if len(contours_inv) > len(contours_normal) else thresh_normal
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     centroids = []
     for cnt in contours:
@@ -90,70 +99,49 @@ def extract_morphological_features(img: np.ndarray) -> dict:
         ]
         symmetry_score = float(np.mean(distances))
 
-    embryo_area     = int(np.sum(thresh == 255))
+    embryo_area = int(np.sum(thresh == 255))
     fragmented_area = sum(cv2.contourArea(c) for c in contours if cv2.contourArea(c) < 500)
     fragmentation_ratio = fragmented_area / embryo_area if embryo_area > 0 else 0.0
-    cell_count = len([c for c in contours if cv2.contourArea(c) > 200])
 
-    return {
-        "symmetry_score":      round(symmetry_score, 4),
-        "fragmentation_ratio": round(fragmentation_ratio, 6),
-        "cell_count":          cell_count,
-    }
+    return np.array([symmetry_score, fragmentation_ratio])
 
 
-def analyze_image(img: np.ndarray, filename: str = "") -> dict:
-    model, scaler = get_model()
+def analyze_image(img: np.ndarray) -> dict:
+    extractor, fusion, scaler = get_models()
 
-    # Image branch: resize to 224x224, normalize
-    img_rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img_rgb, (224, 224)).astype(np.float32) / 255.0
-    img_batch   = np.expand_dims(img_resized, axis=0)
+    deep_features = extract_efficientnet_features(img, extractor)
+    morph_raw = extract_morphological_features(img)
+    morph_scaled = scaler.transform([morph_raw])[0]
 
-    # Morphological branch
-    morph = extract_morphological_features(img)
-    morph_features = np.array([[
-        morph["symmetry_score"],
-        morph["fragmentation_ratio"],
-        morph["cell_count"]
-    ]], dtype=np.float32)
+    combined = np.expand_dims(np.concatenate([deep_features, morph_scaled]), axis=0)
+    prediction = fusion.predict(combined, verbose=0)[0]
 
-    if scaler is not None:
-        morph_features = scaler.transform(morph_features).astype(np.float32)
-
-    # Predict
-    try:
-        prediction = model.predict([img_batch, morph_features], verbose=0)[0]
-    except Exception:
-        # Fallback: try single input
-        prediction = model.predict(img_batch, verbose=0)[0]
-
-    class_id   = int(np.argmax(prediction))
-    good_prob  = float(prediction[1]) if len(prediction) > 1 else float(prediction[0])
-    poor_prob  = 1.0 - good_prob
+    good_prob = float(prediction[1])
+    poor_prob = float(prediction[0])
     confidence = float(np.max(prediction))
-    score      = round(good_prob * 100, 2)
+    score = round(good_prob * 100, 2)
+
+    # Use lowered threshold to fix all-poor prediction from class imbalance
+    is_good = good_prob >= GOOD_THRESHOLD
 
     if score >= 80:
         rec = "Highly recommended for transfer"
     elif score >= 60:
         rec = "Suitable for transfer"
-    elif score >= 40:
+    elif score >= GOOD_THRESHOLD * 100:
         rec = "Marginal quality — use only if no better option"
     else:
         rec = "Poor quality — not recommended for transfer"
 
     return {
-        "filename":                filename,
-        "label":                   "Good Quality Embryo" if class_id == 1 else "Poor Quality Embryo",
-        "confidence":              round(confidence, 4),
+        "label": "Good Quality Embryo" if is_good else "Poor Quality Embryo",
+        "confidence": round(confidence, 4),
         "viability_score_percent": score,
-        "good_probability":        round(good_prob, 4),
-        "poor_probability":        round(poor_prob, 4),
-        "symmetry_score":          morph["symmetry_score"],
-        "fragmentation_ratio":     morph["fragmentation_ratio"],
-        "cell_count":              morph["cell_count"],
-        "recommendation":          rec,
+        "good_probability": round(good_prob, 4),
+        "poor_probability": round(poor_prob, 4),
+        "symmetry_score": round(float(morph_raw[0]), 4),
+        "fragmentation_ratio": round(float(morph_raw[1]), 6),
+        "recommendation": rec,
     }
 
 
@@ -162,37 +150,46 @@ def analyze_image(img: np.ndarray, filename: str = "") -> dict:
 def root():
     return {
         "message": "Embryo Quality Classifier & Ranker",
-        "version": "4.0.0",
-        "endpoints": {
-            "POST /predict": "Single embryo image",
-            "POST /rank":    "N embryo images → ranked",
+        "usage": {
+            "single": "POST /predict  — upload 1 image file",
+            "batch":  "POST /rank     — upload N image files, get ranked results",
         },
         "docs": "/docs"
     }
+
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
+
 @app.get("/debug")
 def debug():
+    files = ["efficientnet_embryo_model.h5", "dual_branch_embryo_model.keras", "morph_scaler.pkl"]
     return {
-        "model_file":  MODEL_PATH,
-        "scaler_file": SCALER_PATH,
-        "model_exists":  os.path.exists(MODEL_PATH),
-        "scaler_exists": os.path.exists(SCALER_PATH),
-        "model_size_mb": round(os.path.getsize(MODEL_PATH)/1024/1024, 2) if os.path.exists(MODEL_PATH) else 0,
+        "threshold": GOOD_THRESHOLD,
+        "files": {
+            f: {
+                "exists": os.path.exists(f),
+                "size_mb": round(os.path.getsize(f) / 1024 / 1024, 2) if os.path.exists(f) else 0
+            }
+            for f in files
+        }
     }
 
 
 @app.post("/predict")
 async def predict_single(file: UploadFile = File(...)):
     if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail=f"Must be an image, got: {file.content_type}")
+        raise HTTPException(status_code=400, detail=f"File must be an image, got: {file.content_type}")
+
     img = decode_upload(await file.read())
     if img is None:
-        raise HTTPException(status_code=400, detail="Could not decode image.")
-    return analyze_image(img, filename=file.filename)
+        raise HTTPException(status_code=400, detail="Could not decode image. Make sure it's a valid JPG/PNG.")
+
+    result = analyze_image(img)
+    result["filename"] = file.filename
+    return result
 
 
 @app.post("/rank")
@@ -200,22 +197,25 @@ async def rank_embryos(files: list[UploadFile] = File(...)):
     if len(files) < 1:
         raise HTTPException(status_code=400, detail="Upload at least 1 image.")
     if len(files) > 50:
-        raise HTTPException(status_code=400, detail="Max 50 images per request.")
+        raise HTTPException(status_code=400, detail="Maximum 50 images per request.")
 
     results = []
     for i, file in enumerate(files):
         if not file.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail=f"'{file.filename}' is not an image.")
+            raise HTTPException(status_code=400, detail=f"File '{file.filename}' is not an image.")
+
         img = decode_upload(await file.read())
         if img is None:
             raise HTTPException(status_code=400, detail=f"Could not decode '{file.filename}'.")
-        results.append({"embryo_id": f"E{i+1}", **analyze_image(img, filename=file.filename)})
+
+        analysis = analyze_image(img)
+        results.append({"filename": file.filename, "embryo_id": f"E{i+1}", **analysis})
 
     results.sort(key=lambda x: x["viability_score_percent"], reverse=True)
 
     return {
-        "total_analyzed":       len(results),
-        "best_embryo":          results[0]["filename"],
+        "total_analyzed": len(results),
+        "best_embryo": results[0]["filename"],
         "best_viability_score": results[0]["viability_score_percent"],
-        "ranked_embryos":       [{"rank": i+1, **r} for i, r in enumerate(results)]
+        "ranked_embryos": [{"rank": i+1, **r} for i, r in enumerate(results)]
     }
