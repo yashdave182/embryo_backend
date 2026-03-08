@@ -280,11 +280,11 @@ Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {req.groq_api_key}",
+                "Authorization": f"Bearer {req.groq_api_key.strip()}",
                 "Content-Type": "application/json"
             },
             json={
-                "model": "llama3-70b-8192",
+                "model": "llama-3.3-70b-versatile",
                 "max_tokens": 180,
                 "temperature": 0.4,
                 "messages": [
@@ -301,6 +301,8 @@ Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific
             timeout=15
         )
 
+        print(f"Groq status: {response.status_code}", flush=True)
+        print(f"Groq response: {response.text[:300]}", flush=True)
         if response.status_code != 200:
             raise HTTPException(status_code=502, detail=f"Groq API error: {response.text}")
 
