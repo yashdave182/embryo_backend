@@ -242,3 +242,73 @@ async def rank_embryos(files: list[UploadFile] = File(...)):
         "best_viability_score": results[0]["viability_score_percent"],
         "ranked_embryos":       [{"rank": i+1, **r} for i, r in enumerate(results)]
     }
+
+
+# ── Groq AI Insights ──────────────────────────────────────────────────────────
+from pydantic import BaseModel
+
+class InsightRequest(BaseModel):
+    label: str
+    viability_score_percent: float
+    good_probability: float
+    confidence: float
+    symmetry_score: float
+    fragmentation_ratio: float
+    cell_count: int = 0
+    recommendation: str
+    rank: int = 1
+    total_embryos: int = 1
+    groq_api_key: str
+
+@app.post("/insights")
+async def get_insights(req: InsightRequest):
+    """Call Groq LLM to generate clinical AI insights for an embryo result."""
+    try:
+        prompt = f"""Embryo analysis results:
+- Label: {req.label}
+- Viability Score: {req.viability_score_percent}%
+- Good Probability: {round(req.good_probability * 100, 1)}%
+- Confidence: {round(req.confidence * 100, 1)}%
+- Symmetry Score: {req.symmetry_score}
+- Fragmentation Ratio: {round(req.fragmentation_ratio * 100, 2)}%
+- Cell Count: {req.cell_count}
+- Rank: {req.rank} of {req.total_embryos}
+- Recommendation: {req.recommendation}
+
+Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific about the numbers. No markdown, no bullet points, plain text only."""
+
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {req.groq_api_key}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama3-70b-8192",
+                "max_tokens": 180,
+                "temperature": 0.4,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an expert IVF embryologist AI assistant. Give concise, clinical insights about embryo quality based on metrics. Always respond in 2-3 sentences max. Be specific about the numbers. Do not give generic advice. Format: plain text only, no markdown, no bullet points."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ]
+            },
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Groq API error: {response.text}")
+
+        data = response.json()
+        insight = data["choices"][0]["message"]["content"].strip()
+        return {"insight": insight}
+
+    except requests.exceptions.Timeout:
+        raise HTTPException(status_code=504, detail="Groq API timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Insight generation failed: {str(e)}")
