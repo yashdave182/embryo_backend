@@ -276,7 +276,7 @@ async def get_insights(req: InsightRequest):
 - Rank: {req.rank} of {req.total_embryos}
 - Recommendation: {req.recommendation}
 
-Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific about the numbers. No markdown, no bullet points, plain text only."""
+Give a 1 sentence clinical interpretation. Be specific about the numbers."""
 
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -286,12 +286,12 @@ Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific
             },
             json={
                 "model": "llama-3.3-70b-versatile",
-                "max_tokens": 180,
+                "max_tokens": 80,
                 "temperature": 0.4,
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are an expert IVF embryologist AI assistant. Give concise, clinical insights about embryo quality based on metrics. Always respond in 2-3 sentences max. Be specific about the numbers. Do not give generic advice. Format: plain text only, no markdown, no bullet points."
+                        "content": "You are an IVF embryologist AI. Respond in exactly 1 sentence. Be specific about the numbers. No markdown, no bullet points, plain text only."
                     },
                     {
                         "role": "user",
