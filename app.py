@@ -247,6 +247,8 @@ async def rank_embryos(files: list[UploadFile] = File(...)):
 # ── Groq AI Insights ──────────────────────────────────────────────────────────
 from pydantic import BaseModel
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+
 class InsightRequest(BaseModel):
     label: str
     viability_score_percent: float
@@ -258,7 +260,6 @@ class InsightRequest(BaseModel):
     recommendation: str
     rank: int = 1
     total_embryos: int = 1
-    groq_api_key: str
 
 @app.post("/insights")
 async def get_insights(req: InsightRequest):
@@ -280,7 +281,7 @@ Provide a 2-3 sentence clinical interpretation for the embryologist. Be specific
         response = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {req.groq_api_key.strip()}",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json"
             },
             json={
